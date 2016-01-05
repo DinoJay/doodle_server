@@ -1,0 +1,1 @@
+comparePreference (lSlot, _) (rSlot, _) = compare lSlot rSlot 
