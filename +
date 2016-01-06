@@ -24,19 +24,15 @@ data UserType = Teacher | Student | Administrator deriving (Show, Eq)
 
 data User = User { uid :: String, pw :: String, category :: UserType} deriving (Show, Eq)
 
-data Slot = Slot { start :: String, end :: String, scores :: Int } deriving Show
+data Slot = Slot { slot :: (String, String), scores :: Int } deriving Show
 
 instance Ord Slot where
-    (<=) (a) (b) = start a <= start b && end a <= end b
+    (<=) (a) (b) = a <= b
 
 instance Eq Slot where
-    (==) (a) (b) = start a == start b && end a == end b
+    (==) (a) (b) = a == b
 
 data Doodle = Doodle { name :: String, timeslots :: Set Slot, subs :: Set String } deriving (Show)
-
-
-instance Eq Doodle where
-    (==) (a) (b) = name a == name b
 
 -- data Request = Request { action :: String, login :: String, doodle :: Doodle, slot ::  } deriving (Show, Eq)
 
@@ -110,7 +106,8 @@ respAction [action, _, identifier] h user transUserMap userMap _ _
             let newUserMap = Map.insert identifier User {
                                             uid = identifier,
                                             pw = randomStr,
-                                            category = usertype
+                                            category = usertype,
+                                            subs = Set.empty
                                             } userMap
             in
             atomically $ writeTVar transUserMap (newUserMap)
@@ -125,32 +122,27 @@ respAction ["set-doodle", _, doodleId, slotStr] h user _ _ transDoodleMap doodle
     | not isAdmin = hPutStrLn h "you are not Admin"
     | not (doodleExist doodleId doodleMap) && isAdmin =
         do
-            -- let tss = splitOn "," $ stripChars "[]" $ init slotStr
-            hPutStrLn h ("timeslots" ++ show ts)
+            let ts = splitOn "," $ stripChars "[]" $ init slotStr
+            hPutStrLn h ("timeslots" ++ show ts )
             atomically $ writeTVar transDoodleMap (Map.insert doodleId newDoodle doodleMap)
             hPutStrLn h "ok"
     | otherwise = hPutStrLn h "id-taken"
-    where newDoodle = Doodle {name = doodleId, timeslots = Set.fromList ts, subs = Set.empty}
+    where newDoodle = Doodle {name = doodleId, timeslots = ts}
           ts = produceSlots timeList
           timeList  = splitOn "," $ stripChars "[]" $ init slotStr
           isAdmin   = category user == Administrator
 
-respAction ["subscribe", login, doodleId] h user _ _ transDoodleMap doodleMap
-    | maybeDoodle == Nothing = hPutStrLn h "doodle does not exist"
+respAction ["subscribe", login, doodleId] h user transUserMap userMap transDoodleMap doodleMap
+    | doodle == Nothing = hPutStrLn h "doodle does not exist"
     | registered = hPutStrLn h "user is already registered"
-    | maybeDoodle /= Nothing =
-        let newDoodleMap = Map.insert doodleId Doodle {name = doodleId,
-                                           timeslots = timeslots  doodle,
-                                           subs = newSubs
-                                           }
-                                           doodleMap
+    | doodle /= Nothing =
+        let newUserMap = Map.insert Doodle {name = doodleId, timeslots = timeslots doodle}
         in do
-              atomically $ writeTVar transDoodleMap (newDoodleMap)
+              atomically $ writeTVar transUserMap (newUserMap)
               hPutStrLn h "ok"
-    where maybeDoodle = Map.lookup doodleId doodleMap
-          doodle      = fromJust maybeDoodle
-          registered  = Set.member (uid user) (subs doodle)
-          newSubs     = Set.insert login $ subs doodle
+
+    where doodle     = Map.lookup doodleId doodleMap
+          registered = Set.member (uid user) (subs doodle)
 
 -- respAction ["prefer", login, doodleId, slotString] h user transUserMap userMap transDoodleMap doodleMap
 --     | registered =
@@ -172,10 +164,8 @@ respAction _ h _ _ _ _ _=
 userExist login userMap = if user /= Nothing then True else False
     where user = Map.lookup login userMap
 
-doodleExist identifier doodleMap =
-    if maybeDoodle/= Nothing then True else False
-    where maybeDoodle = Map.lookup identifier doodleMap
-
+doodleExist identifier doodleMap = if doodle /= Nothing then True else False
+    where doodle = Map.lookup identifier doodleMap
 -- remove whitespace in slot
 removeWs :: [[Char]] -> [[Char]]
 removeWs ("set-doodle": login : doodleId : rest)
@@ -271,33 +261,25 @@ readDoodle' h acc =
             else (readDoodle' h (acc ++ line))
 
 -- produceSlots :: [[Char]] -> [Slot]
---
--- produceSlots _ = Set.insert Slot {slot = ("ero", "err"), scores=1} Set.empty
--- produceSlots [] = Set.empty
--- produceSlots (ts:rest) | length tsList == 2 =
---     Set.insert ( Slot {slot = (start, end), scores = 0} ) (produceSlots rest)
---     where tsList@( start : end : _ ) = splitOn "/" ts
-
-produceSlots [] = []
-produceSlots (slot:slots) =
-        [Slot {start = st, end = et, scores = 0}] ++ (produceSlots slots)
-        where [st, et] = splitOn "/" slot
-
+produceSlots [] = Set.empty
+produceSlots (sl:sls) | length tsList == 2 =
+    Set.insert Slot {slot = (start, end), scores = 0} (produceSlots sls)
+    where tsList@( start : end : _ ) = splitOn "/" sl
 
 -- doodleNameTest doodleName doodle = doodleName == name doodle
---
--- printDoodle h (doodle:[]) = do
---                                let (start, end) = slot doodle
---                                hPutStrLn h $ "\t" ++ start ++ " / " ++ end
---                                hPutStrLn h "]"
---
--- printDoodle h (doodle:doodles) = do
---                                         let (start, end) = slot doodle
---                                         hPutStrLn h "ok ["
---                                         hPutStrLn h $ "\t" ++ start ++ " / " ++ end ++ ","
---                                         printDoodle h doodles
 
--- slotExistenceTest [start, end] mySlot = (start, end) == slot mySlot
+printDoodle h (doodle:[]) = do
+                               let (start, end) = slot doodle
+                               hPutStrLn h $ "\t" ++ start ++ " / " ++ end
+                               hPutStrLn h "]"
+
+printDoodle h (doodle:doodles) = do
+                                        let (start, end) = slot doodle
+                                        hPutStrLn h "ok ["
+                                        hPutStrLn h $ "\t" ++ start ++ " / " ++ end ++ ","
+                                        printDoodle h doodles
+
+slotExistenceTest [start, end] mySlot = (start, end) == slot mySlot
 
 -- updatePreference h user transDoodleMap name [start, end] = do  let subscribeList = subscribe user
 --                                                                 if all (subscriptionListTest name) subscribeList
