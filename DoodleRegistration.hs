@@ -22,9 +22,9 @@ import qualified Data.Set as Set
 
 data UserType = Teacher | Student | Administrator deriving (Show, Eq)
 
-data User = User { uid :: String, pw :: String, category :: UserType} deriving (Show, Eq)
+data User = User {uid :: String, pw :: String, category :: UserType} deriving (Show, Eq)
 
-data Slot = Slot { start :: String, end :: String, scores :: Int } deriving Show
+data Slot = Slot {start :: String, end :: String} deriving Show
 
 instance Ord Slot where
     (<=) (a) (b) = start a <= start b && end a <= end b
@@ -32,7 +32,7 @@ instance Ord Slot where
 instance Eq Slot where
     (==) (a) (b) = start a == start b && end a == end b
 
-data Doodle = Doodle { name :: String, timeslots :: Set Slot, subs :: Set String } deriving (Show)
+data Doodle = Doodle { name :: String, timeslots :: Map Slot (Set String), subs :: Set String } deriving (Show)
 
 
 instance Eq Doodle where
@@ -123,24 +123,28 @@ respAction [action, _, identifier] h user transUserMap userMap _ _
 
 respAction ["set-doodle", _, doodleId, slotStr] h user _ _ transDoodleMap doodleMap
     | not isAdmin = hPutStrLn h "you are not Admin"
+    | maybeTs == Nothing = hPutStrLn h "slot strings are malformatted"
     | not (doodleExist doodleId doodleMap) && isAdmin =
-        do
+        let newDoodle = Doodle {name = doodleId,
+                                timeslots = fromJust maybeTs,
+                                subs = Set.empty
+                               }
+        in do
             -- let tss = splitOn "," $ stripChars "[]" $ init slotStr
-            hPutStrLn h ("timeslots" ++ show ts)
+            -- hPutStrLn h ("timeslots" ++ show ts)
             atomically $ writeTVar transDoodleMap (Map.insert doodleId newDoodle doodleMap)
             hPutStrLn h "ok"
     | otherwise = hPutStrLn h "id-taken"
-    where newDoodle = Doodle {name = doodleId, timeslots = Set.fromList ts, subs = Set.empty}
-          ts = produceSlots timeList
-          timeList  = splitOn "," $ stripChars "[]" $ init slotStr
+    where timeList  = splitOn "," $ stripChars "[]" $ init slotStr
+          maybeTs   = parseSlots timeList
           isAdmin   = category user == Administrator
 
 respAction ["subscribe", login, doodleId] h user _ _ transDoodleMap doodleMap
     | maybeDoodle == Nothing = hPutStrLn h "doodle does not exist"
-    | registered = hPutStrLn h "user is already registered"
+    | subscribed = hPutStrLn h "user is already subscribed"
     | maybeDoodle /= Nothing =
         let newDoodleMap = Map.insert doodleId Doodle {name = doodleId,
-                                           timeslots = timeslots  doodle,
+                                           timeslots = timeslots doodle,
                                            subs = newSubs
                                            }
                                            doodleMap
@@ -149,19 +153,33 @@ respAction ["subscribe", login, doodleId] h user _ _ transDoodleMap doodleMap
               hPutStrLn h "ok"
     where maybeDoodle = Map.lookup doodleId doodleMap
           doodle      = fromJust maybeDoodle
-          registered  = Set.member (uid user) (subs doodle)
-          newSubs     = Set.insert login $ subs doodle
+          subscribed  = Set.member (uid user) (subs doodle)
+          newSubs     = Set.insert (uid user) $ subs doodle
 
--- respAction ["prefer", login, doodleId, slotString] h user transUserMap userMap transDoodleMap doodleMap
---     | registered =
---        let [timeSlot] = produceSlots [slotString]
---         in do
---               atomically $ writeTVar transUserMap (newUserMap)
---               hPutStrLn h "ok"
---     | otherwise = hPutStrLn h "not-subscribed"
---     where doodle     = Map.lookup doodleId doodleMap
---           registered = Set.member (uid user) (subs user)
---
+respAction ["prefer", login, doodleId, slotString] h user transUserMap userMap transDoodleMap doodleMap
+    | maybeDoodle == Nothing = hPutStrLn h "no-such-id"
+    | not subscribed  = hPutStrLn h "not-subscribed"
+    | subscribed =
+        let newDoodleMap = Map.insert doodleId Doodle {name = doodleId,
+                                                 timeslots = newTimeslots,
+                                                 subs = subs doodle
+                                               } doodleMap
+        in do
+        atomically $ writeTVar transDoodleMap (newDoodleMap)
+        hPutStrLn h "ok"
+    where
+          subscribed    = Set.member (uid user) (subs doodle)
+          maybeDoodle   = Map.lookup doodleId doodleMap
+          doodle        = fromJust maybeDoodle
+          ts            = fromJust $ parseSlot slotString
+          maybeOldPrefs = Map.lookup ts (timeslots doodle)
+          oldPrefs      = if maybeOldPrefs /= Nothing
+                              then fromJust maybeOldPrefs
+                          else Set.empty
+          newPrefs      = Set.insert (uid user) oldPrefs
+          newTimeslots  = Map.insert ts newPrefs (timeslots doodle)
+
+
 
 
 -- error state
@@ -270,18 +288,32 @@ readDoodle' h acc =
             then return (stripChars "\t" $ acc ++ line)
             else (readDoodle' h (acc ++ line))
 
--- produceSlots :: [[Char]] -> [Slot]
---
--- produceSlots _ = Set.insert Slot {slot = ("ero", "err"), scores=1} Set.empty
--- produceSlots [] = Set.empty
--- produceSlots (ts:rest) | length tsList == 2 =
---     Set.insert ( Slot {slot = (start, end), scores = 0} ) (produceSlots rest)
---     where tsList@( start : end : _ ) = splitOn "/" ts
+-- -- parseSlots :: [[Char]] -> [Slot]
 
-produceSlots [] = []
-produceSlots (slot:slots) =
-        [Slot {start = st, end = et, scores = 0}] ++ (produceSlots slots)
-        where [st, et] = splitOn "/" slot
+getVotes ts doodleMap =
+        if userSet /= Nothing then Just $ length (fromJust userSet) else Nothing
+    where userSet = Map.lookup ts doodleMap
+
+parseSlots :: [String] -> Maybe (Map Slot (Set String))
+parseSlots tss = foldl (\acc str ->
+                    let ts = parseSlot str
+                        tsExistNot = Map.lookup (fromJust ts) ( fromJust acc ) == Nothing
+                    in if ts /= Nothing && tsExistNot
+                           then Just $ Map.insert (fromJust ts) Set.empty (fromJust acc)
+                       else Nothing
+                 ) (Just Map.empty) tss
+
+parseSlot ts | length tsList == 2 =
+    -- TODO:
+    Just Slot {start = st, end = et}
+    where tsList@(st : et : _) = splitOn "/" $ stripChars " " ts
+
+parseSlot _ = Nothing
+
+-- parseSlots [] = []
+-- parseSlots (slot:slots) =
+--         [Slot {start = st, end = et, scores = 0}] ++ (parseSlots slots)
+--         where [st, et] = splitOn "/" slot
 
 
 -- doodleNameTest doodleName doodle = doodleName == name doodle
