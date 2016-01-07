@@ -13,18 +13,25 @@ import Data.Maybe
 import Data.String.Utils
 import Data.List
 import Data.List.Split
-import System.IO.Unsafe
+-- import System.IO.Unsafe
+import Data.Function
+import Data.Ord
 import System.Random
 import qualified Data.Map as Map
 import Data.Map (Map)
 import Data.Set (Set)
+import Data.List
 import qualified Data.Set as Set
 
 data UserType = Teacher | Student | Administrator deriving (Show, Eq)
 
-data User = User {uid :: String, pw :: String, category :: UserType} deriving (Show, Eq)
+data User = User {uid :: String, pw :: String, category :: UserType, subs :: Set String  } deriving (Show, Eq)
 
-data Slot = Slot {start :: String, end :: String} deriving Show
+data Slot = Slot {start :: String, end :: String}
+
+
+instance Show Slot where
+    show s = show "(" ++ start s ++ ", " ++ end s ++")"
 
 instance Ord Slot where
     (<=) (a) (b) = start a <= start b && end a <= end b
@@ -32,11 +39,15 @@ instance Ord Slot where
 instance Eq Slot where
     (==) (a) (b) = start a == start b && end a == end b
 
-data Doodle = Doodle { name :: String, timeslots :: Map Slot (Set String), subs :: Set String } deriving (Show)
 
+data Doodle = Doodle {name :: String, timeslots :: Map Slot (Set String)} deriving (Show)
 
 instance Eq Doodle where
     (==) (a) (b) = name a == name b
+
+-- instance Show [Doodle] where
+-- myshow:: [[Slot]] -> String
+-- myshow ds = concatMap ds (\d -> show d)
 
 -- data Request = Request { action :: String, login :: String, doodle :: Doodle, slot ::  } deriving (Show, Eq)
 
@@ -46,9 +57,11 @@ stripChars = filter . flip notElem
 main :: IO ()
 main = withSocketsDo $ do
     [login, token] <- getArgs
-    let userMap = Map.insert login User {uid = login,
-                                    pw = token,
-                                    category = Administrator
+    let userMap = Map.insert login User {
+                                    uid      = login,
+                                    pw       = token,
+                                    category = Administrator,
+                                    subs     = Set.empty
                                     } Map.empty
     transUserMap <- newTVarIO (userMap)
     let doodleMap = Map.empty :: Map String Doodle
@@ -87,47 +100,54 @@ userLoginTest [myLogin, myToken] user =
 handleRequest::Handle -> TVar (Map [Char] User) -> TVar ( Map [Char] Doodle ) -> IO b
 handleRequest h transUserMap transDoodleMap =
     do
-        tokens@(_: login: _) <- tokenizeRule h
-        hPutStrLn h $ "tokens\n" ++ ( show tokens )
-        userMap <- atomically $ readTVar transUserMap
-        doodleMap <- atomically $ readTVar transDoodleMap
-        let user = getUser login userMap
-        if user /= Nothing
-            then respAction tokens h (fromJust user) transUserMap userMap transDoodleMap doodleMap
-        else hPutStrLn h "wrong login"
+        tokens <- tokenizeRule h
+        if length tokens == 0
+            then handleRequest h transUserMap transDoodleMap
+        else do
+            let login = tokens !! 1
+            -- tokens@(_: login: _) <- tokenizeRule h
+            hPutStrLn h $ "tokens\n" ++ ( show tokens )
+            userMap <- atomically $ readTVar transUserMap
+            doodleMap <- atomically $ readTVar transDoodleMap
+            let user = getUser login userMap
+            if user /= Nothing
+                then respAction tokens h (fromJust user) transUserMap userMap transDoodleMap doodleMap
+            else hPutStrLn h "wrong login"
 
-        newUserMap <- atomically $ readTVar transUserMap
-        newDoodleMap <- atomically $ readTVar transDoodleMap
-        hPutStrLn h ("userMap\n" ++ show newUserMap)
-        hPutStrLn h ("doodleMap\n" ++ show newDoodleMap)
+            newUserMap <- atomically $ readTVar transUserMap
+            newDoodleMap <- atomically $ readTVar transDoodleMap
+            hPutStrLn h ("userMap\n" ++ show newUserMap)
+            hPutStrLn h ("doodleMap\n" ++ show newDoodleMap)
 
-        handleRequest h transUserMap transDoodleMap
+            handleRequest h transUserMap transDoodleMap
 
 respAction [action, _, identifier] h user transUserMap userMap _ _
-    | not isAdmin = hPutStrLn h "you are not admin!"
-    | userExists = hPutStrLn h "id taken"
-    | action == "add-teacher" || action == "add-student" =
-            let newUserMap = Map.insert identifier User {
-                                            uid = identifier,
-                                            pw = randomStr,
-                                            category = usertype
+    | addRules && not isAdmin = hPutStrLn h "you are not admin!"
+    | addRules && userExists = hPutStrLn h "id taken"
+    | addRules =
+            let newUserMap = Map.insert (identifier) User {
+                                            uid      = identifier,
+                                            pw       = "aaaa",
+                                            category = usertype,
+                                            subs     = Set.empty
                                             } userMap
-            in
-            atomically $ writeTVar transUserMap (newUserMap)
+            in do
+                atomically $ writeTVar transUserMap (newUserMap)
+                hPutStrLn h "ok"
     where
+          addRules = action == "add-teacher" || action == "add-student"
           isAdmin = category user == Administrator
           userExists = userExist identifier userMap
           usertype = if action == "add-teacher" then Teacher else Student
           -- TODO
-          randomStr = take 4 $ randomRs ('a','z') $ unsafePerformIO newStdGen
+          -- randomStr = take 4 $ randomRs ('a','z') $ unsafePerformIO newStdGen
 
 respAction ["set-doodle", _, doodleId, slotStr] h user _ _ transDoodleMap doodleMap
     | not isAdmin = hPutStrLn h "you are not Admin"
     | maybeTs == Nothing = hPutStrLn h "slot strings are malformatted"
     | not (doodleExist doodleId doodleMap) && isAdmin =
         let newDoodle = Doodle {name = doodleId,
-                                timeslots = fromJust maybeTs,
-                                subs = Set.empty
+                                timeslots = fromJust maybeTs
                                }
         in do
             -- let tss = splitOn "," $ stripChars "[]" $ init slotStr
@@ -139,38 +159,39 @@ respAction ["set-doodle", _, doodleId, slotStr] h user _ _ transDoodleMap doodle
           maybeTs   = parseSlots timeList
           isAdmin   = category user == Administrator
 
-respAction ["subscribe", login, doodleId] h user _ _ transDoodleMap doodleMap
+respAction ["subscribe", login, doodleId] h user transUserMap userMap transDoodleMap doodleMap
     | maybeDoodle == Nothing = hPutStrLn h "doodle does not exist"
     | subscribed = hPutStrLn h "user is already subscribed"
     | maybeDoodle /= Nothing =
-        let newDoodleMap = Map.insert doodleId Doodle {name = doodleId,
-                                           timeslots = timeslots doodle,
-                                           subs = newSubs
-                                           }
-                                           doodleMap
+        let newUserMap = Map.insert (uid user) User {
+                                                uid      = uid user,
+                                                pw       = "aaaa",
+                                                category = category user,
+                                                subs     = newSubs
+                                               } userMap
         in do
-              atomically $ writeTVar transDoodleMap (newDoodleMap)
+              atomically $ writeTVar transUserMap (newUserMap)
               hPutStrLn h "ok"
     where maybeDoodle = Map.lookup doodleId doodleMap
           doodle      = fromJust maybeDoodle
-          subscribed  = Set.member (uid user) (subs doodle)
-          newSubs     = Set.insert (uid user) $ subs doodle
+          subscribed  = Set.member (uid user) (subs user)
+          newSubs     = Set.insert (name doodle) $ subs user
 
 respAction ["prefer", login, doodleId, slotString] h user transUserMap userMap transDoodleMap doodleMap
     | maybeDoodle == Nothing = hPutStrLn h "no-such-id"
     | not subscribed  = hPutStrLn h "not-subscribed"
     | subscribed =
-        let newDoodleMap = Map.insert doodleId Doodle {name = doodleId,
-                                                 timeslots = newTimeslots,
-                                                 subs = subs doodle
+        let newDoodleMap = Map.insert doodleId Doodle {
+                                                      name = doodleId,
+                                                      timeslots = newTimeslots
                                                } doodleMap
         in do
-        atomically $ writeTVar transDoodleMap (newDoodleMap)
-        hPutStrLn h "ok"
+            atomically $ writeTVar transDoodleMap (newDoodleMap)
+            hPutStrLn h "ok"
     where
-          subscribed    = Set.member (uid user) (subs doodle)
-          maybeDoodle   = Map.lookup doodleId doodleMap
           doodle        = fromJust maybeDoodle
+          subscribed    = Set.member (name doodle) (subs user)
+          maybeDoodle   = Map.lookup doodleId doodleMap
           ts            = fromJust $ parseSlot slotString
           maybeOldPrefs = Map.lookup ts (timeslots doodle)
           oldPrefs      = if maybeOldPrefs /= Nothing
@@ -179,13 +200,51 @@ respAction ["prefer", login, doodleId, slotString] h user transUserMap userMap t
           newPrefs      = Set.insert (uid user) oldPrefs
           newTimeslots  = Map.insert ts newPrefs (timeslots doodle)
 
+respAction ["exam-schedule", _] h user transUserMap userMap transDoodleMap doodleMap =
+        -- let sch = calcSchedule userMap doodleMap
+        -- in hPutStrLn h (concatMap sch (\d -> show $ head d))
+        let sch = sequence [[(name d, ts, getVotes ts d)
+                               | ts <- (Map.keys $ timeslots d)]
+                               | d <- (Map.elems doodleMap)]
+            sumSeq = [(Map.fromList $ map (\(did, t, _) -> (did, t)) s, sumSnd s)| s <- sch]
+            sortSeq = reverse $ sortBy (compare `on` snd) sumSeq
+            times = filterTimes sortSeq userMap
+        in do
+              hPutStrLn h $ "COMBS" ++ show times
+              -- hPutStrLn h $ "length" ++ show (length sumSeq)
 
+-- noTimeClash :: Ord a => Map k (Ts a) -> (a, a) -> Bool
+-- noTimeClash xs (t2, t3) = List.null $ Map.elems $ Map.filter (\y -> ( start y >= t2 && start y <= t3 || (end y >= t2 && end y <= t3) )) xs
 
+filterTimes sch userMap =
+     find (\(_, _, b)-> b==True) [(s, p, all (==False) [ allOverlap $ map fromJust $ filter (/=Nothing) userSlotList |
+                              userSlotList <- [[Map.lookup did s |
+                                          did <- Set.elems $ subs user]|
+                                          user <- Map.elems userMap
+                                          ]
+                               ]
+                                ) | (s, p) <- sch
+                               ]
 
--- error state
-respAction _ h _ _ _ _ _=
-    do
-        hPutStrLn h "entered: error_state"
+--
+sumSnd = foldr (\(_, _, c) acc -> c + acc) 0
+-- calcSchedule userMap doodleMap =
+
+-- hasNoDups:: [Slot] -> Bool
+-- hasNoDups l = ( length $ nubBy allOverlap l ) == length l
+
+overlap (i,a) (j, b) = helper a b && i /= j
+    where helper x y = start x >= start y && start x <= end y || end x >= start y && end x <= end y
+
+allOverlap:: [Slot] -> Bool
+allOverlap xs =
+        any (==True) $ concat [[overlap x y |x <- zipped]| y <- zipped]
+        where zipped = zip [0 ..] xs
+
+-- -- error state
+-- respAction _ h _ _ _ _ _=
+--     do
+--         hPutStrLn h "entered: error_state"
 
 userExist login userMap = if user /= Nothing then True else False
     where user = Map.lookup login userMap
@@ -253,7 +312,7 @@ _tokenizeRule h tokens@(["set-doodle", login, doodleId, str])
     | otherwise =
             do
                hPutStrLn h "error slotstring does not start with ["
-               return ["error"]
+               return []
 
 _tokenizeRule h (action : oldArgs)
     | length oldArgs < 2 =
@@ -263,11 +322,9 @@ _tokenizeRule h (action : oldArgs)
             _tokenizeRule h ((action : oldArgs) ++ args)
 
 
-_tokenizeRule h _ =
-    do
-       hPutStrLn h "error state"
-       return ["error"]
-
+_tokenizeRule _ _ =
+    -- hPutStrLn h "error state X"
+    return []
 
 
 readDoodle :: Handle -> [Char] -> IO [Char]
@@ -277,7 +334,7 @@ readDoodle h line
     | startswith "[" line =
         do
             readDoodle' h (stripChars "\t" line)
-    | otherwise = error "doole does not begin with ["
+    | otherwise = error "doodle does not begin with ["
     where stLine = strip line
 
 readDoodle' :: Handle -> [Char] -> IO [Char]
@@ -290,9 +347,9 @@ readDoodle' h acc =
 
 -- -- parseSlots :: [[Char]] -> [Slot]
 
-getVotes ts doodleMap =
-        if userSet /= Nothing then Just $ length (fromJust userSet) else Nothing
-    where userSet = Map.lookup ts doodleMap
+getVotes ts doodle =
+        if preferences /= Nothing then Set.size (fromJust preferences) else 0
+    where preferences = Map.lookup ts $ timeslots doodle
 
 parseSlots :: [String] -> Maybe (Map Slot (Set String))
 parseSlots tss = foldl (\acc str ->
@@ -303,69 +360,11 @@ parseSlots tss = foldl (\acc str ->
                        else Nothing
                  ) (Just Map.empty) tss
 
-parseSlot ts | length tsList == 2 =
+parseSlot ts
+    | length tsList == 2 =
     -- TODO:
     Just Slot {start = st, end = et}
     where tsList@(st : et : _) = splitOn "/" $ stripChars " " ts
 
 parseSlot _ = Nothing
 
--- parseSlots [] = []
--- parseSlots (slot:slots) =
---         [Slot {start = st, end = et, scores = 0}] ++ (parseSlots slots)
---         where [st, et] = splitOn "/" slot
-
-
--- doodleNameTest doodleName doodle = doodleName == name doodle
---
--- printDoodle h (doodle:[]) = do
---                                let (start, end) = slot doodle
---                                hPutStrLn h $ "\t" ++ start ++ " / " ++ end
---                                hPutStrLn h "]"
---
--- printDoodle h (doodle:doodles) = do
---                                         let (start, end) = slot doodle
---                                         hPutStrLn h "ok ["
---                                         hPutStrLn h $ "\t" ++ start ++ " / " ++ end ++ ","
---                                         printDoodle h doodles
-
--- slotExistenceTest [start, end] mySlot = (start, end) == slot mySlot
-
--- updatePreference h user transDoodleMap name [start, end] = do  let subscribeList = subscribe user
---                                                                 if all (subscriptionListTest name) subscribeList
---                                                                 then do hPutStrLn h "Not subscribed"
---                                                                         return $ subscribe user
---                                                                 else do
---                                                                         let (oldName, (oldStart, oldEnd)) = fromJust $ find (subscriptionListNegateTest name) subscribeList
---                                                                         doodles <- atomically $ readTVar transDoodleMap
---                                                                         let [theDoodle] = filter (doodleNameTest name) doodles
---                                                                         addedSlots <- addScores theDoodle [start, end]
---                                                                         newSlots <- minusScores (Doodle {name = name, slots = addedSlots}) [oldStart, oldEnd]
---                                                                         let restDoodles = delete theDoodle doodles
---                                                                         atomically $ writeTVar transDoodleMap $ restDoodles ++ [Doodle {name = name, slots = newSlots}]
---                                                                         return $ (filter (subscriptionListTest name) subscribeList) ++ [(name, (start, end))]
-
--- subscriptionListTest name (doodleName, slot) = name /= doodleName
--- subscriptionListNegateTest name (doodleName, slot) = name == doodleName
---
--- addScores theDoodle [start, end] = do
---                                     let [theSlot] = filter (slotExistenceTest [start, end]) $ slots theDoodle
---                                     let theRestSlots = delete theSlot $ slots theDoodle
---                                     let newScore = 1 + scores theSlot
---                                     return $ theRestSlots ++ [ Slot { slot = (start, end), scores = newScore }]
---
--- minusScores theDoodle [start, end] = do
---                                     let [theSlot] = filter (slotExistenceTest [start, end]) $ slots theDoodle
---                                     let theRestSlots = delete theSlot $ slots theDoodle
---                                     let newScore = scores theSlot - 1
---                                     return $ theRestSlots ++ [ Slot { slot = (start, end), scores = newScore }]
---
--- printSchedules h (doodle:doodles)
---     | length doodles /= 0 = do  printSchedule h doodle
---                                 printSchedules h doodles
---     | otherwise           = do  printSchedule h doodle
---
--- printSchedule h doodle = do    let (start, end) = slot $ maximumBy (compareSlotPreference) (slots doodle)
---                                     hPutStrLn h $ "{"++name doodle++" : "++start++"/"++end++"}"
---
--- compareSlotPreference lSlot rSlot = compare (scores lSlot) (scores rSlot)
