@@ -15,23 +15,24 @@ import Data.List
 import Data.List.Split
 -- import System.IO.Unsafe
 import Data.Function
-import Data.Ord
 import System.Random
 import qualified Data.Map as Map
 import Data.Map (Map)
 import Data.Set (Set)
-import Data.List
 import qualified Data.Set as Set
+
+import System.Locale
+import Data.Time
 
 data UserType = Teacher | Student | Administrator deriving (Show, Eq)
 
 data User = User {uid :: String, pw :: String, category :: UserType, subs :: Set String  } deriving (Show, Eq)
 
-data Slot = Slot {start :: String, end :: String}
+data Slot = Slot {start :: UTCTime, end :: UTCTime}
 
 
 instance Show Slot where
-    show s = show "(" ++ start s ++ ", " ++ end s ++")"
+    show s = show "(" ++ (show $ start s) ++ ", " ++ (show $ end s ) ++")"
 
 instance Ord Slot where
     (<=) (a) (b) = start a <= start b && end a <= end b
@@ -44,12 +45,6 @@ data Doodle = Doodle {name :: String, timeslots :: Map Slot (Set String)} derivi
 
 instance Eq Doodle where
     (==) (a) (b) = name a == name b
-
--- instance Show [Doodle] where
--- myshow:: [[Slot]] -> String
--- myshow ds = concatMap ds (\d -> show d)
-
--- data Request = Request { action :: String, login :: String, doodle :: Doodle, slot ::  } deriving (Show, Eq)
 
 stripChars :: String -> String -> String
 stripChars = filter . flip notElem
@@ -72,38 +67,42 @@ main = withSocketsDo $ do
     mySocket <- socket AF_INET Stream defaultProtocol
     bind mySocket (SockAddrInet 5002 0)
     listen mySocket 5
-    loop mySocket channel transUserMap transDoodleMap 0
+    loop mySocket channel transUserMap transDoodleMap
 
-loop socket channel transUserMap transDoodleMap number = do
-    (sock, addr) <- Network.Socket.accept socket
+loop :: Socket -> t -> TVar (Map [Char] User) -> TVar (Map [Char] Doodle) -> IO b
+loop s channel transUserMap transDoodleMap = do
+    (sock, _) <- Network.Socket.accept s
     h <- socketToHandle sock ReadWriteMode
-    forkIO $ handleConnection h channel transUserMap transDoodleMap number
-    loop socket channel transUserMap transDoodleMap $ number + 1
+    forkIO $ handleConnection h transUserMap transDoodleMap
+    loop s channel transUserMap transDoodleMap
 
---handleConnection :: (Socket, SockAddr) -> Chan String -> Int -> IO ()
-handleConnection h channel transUserMap transDoodleMap number = do
+handleConnection :: Handle -> TVar (Map [Char] User) -> TVar (Map [Char] Doodle) -> IO ()
+handleConnection h  transUserMap transDoodleMap = do
     hSetBuffering h LineBuffering
     handleRequest h transUserMap transDoodleMap
     hClose h
 
 -- Code block to h login
-getUser loginInfo userMap =
-    do
-        let [login, myToken] = Data.String.Utils.split "@" loginInfo
-        Map.lookup login userMap
-
-userLoginTest [myLogin, myToken] user =
-    if (uid user) == myLogin && (pw user) == myToken
-    then True
-    else False
+getUser :: [Char] -> Map [Char] User -> Maybe User
+getUser loginInfo userMap
+        | maybeUser == Nothing = Nothing
+        | otherwise =
+            let user = fromJust maybeUser
+              in if pw user == enterPw then maybeUser else Nothing
+            -- maybeUser
+        where [uidStr, enterPw] = Data.String.Utils.split "@" loginInfo
+              maybeUser        = Map.lookup uidStr userMap
 
 handleRequest::Handle -> TVar (Map [Char] User) -> TVar ( Map [Char] Doodle ) -> IO b
 handleRequest h transUserMap transDoodleMap =
     do
-        tokens <- tokenizeRule h
-        if length tokens == 0
-            then handleRequest h transUserMap transDoodleMap
+        maybeTokens <- tokenizeRule h
+        if maybeTokens == Nothing
+            then do
+                    hPutStrLn h "invalid inputString\n"
+                    handleRequest h transUserMap transDoodleMap
         else do
+            let tokens = fromJust maybeTokens
             let login = tokens !! 1
             -- tokens@(_: login: _) <- tokenizeRule h
             hPutStrLn h $ "tokens\n" ++ ( show tokens )
@@ -121,6 +120,8 @@ handleRequest h transUserMap transDoodleMap =
 
             handleRequest h transUserMap transDoodleMap
 
+respAction :: [[Char]] -> Handle -> User -> TVar (Map [Char] User)
+    -> Map [Char] User -> TVar (Map [Char] Doodle) -> Map [Char] Doodle -> IO ()
 respAction [action, _, identifier] h user transUserMap userMap _ _
     | addRules && not isAdmin = hPutStrLn h "you are not admin!"
     | addRules && userExists = hPutStrLn h "id taken"
@@ -159,13 +160,13 @@ respAction ["set-doodle", _, doodleId, slotStr] h user _ _ transDoodleMap doodle
           maybeTs   = parseSlots timeList
           isAdmin   = category user == Administrator
 
-respAction ["subscribe", login, doodleId] h user transUserMap userMap transDoodleMap doodleMap
+respAction ["subscribe", _, doodleId] h user transUserMap userMap _ doodleMap
     | maybeDoodle == Nothing = hPutStrLn h "doodle does not exist"
     | subscribed = hPutStrLn h "user is already subscribed"
     | maybeDoodle /= Nothing =
         let newUserMap = Map.insert (uid user) User {
                                                 uid      = uid user,
-                                                pw       = "aaaa",
+                                                pw       = pw user,
                                                 category = category user,
                                                 subs     = newSubs
                                                } userMap
@@ -177,7 +178,7 @@ respAction ["subscribe", login, doodleId] h user transUserMap userMap transDoodl
           subscribed  = Set.member (uid user) (subs user)
           newSubs     = Set.insert (name doodle) $ subs user
 
-respAction ["prefer", login, doodleId, slotString] h user transUserMap userMap transDoodleMap doodleMap
+respAction ["prefer", _, doodleId, slotString] h user _ _ transDoodleMap doodleMap
     | maybeDoodle == Nothing = hPutStrLn h "no-such-id"
     | not subscribed  = hPutStrLn h "not-subscribed"
     | maybeOldPrefs == Nothing = hPutStrLn h "timeslot does not exist!"
@@ -210,8 +211,8 @@ respAction ["exam-schedule", _] h _ _ userMap _ doodleMap =
             times = _getBestSchedule sortSeq userMap
         in do
               hPutStrLn h $ "COMBS" ++ show times
-              -- hPutStrLn h $ "length" ++ show (length sumSeq)
 
+_getBestSchedule :: [(Map String Slot, t)] -> Map k User -> Maybe (Map String Slot, t, Bool)
 _getBestSchedule sch userMap =
      find (\(_, _, b)-> b==True) [(s, p, all (==False) [
                                  allOverlap $ map fromJust $ filter (/=Nothing) userSlotList |
@@ -222,13 +223,13 @@ _getBestSchedule sch userMap =
                           did <- Set.elems $ subs user]|
                           user <- Map.elems uMap
                           ]
---
+_sumSnd :: [(t, t1, Int)] -> Int
 _sumSnd = foldr (\(_, _, c) acc -> c + acc) 0
 -- calcSchedule userMap doodleMap =
 
 -- hasNoDups:: [Slot] -> Bool
 -- hasNoDups l = ( length $ nubBy allOverlap l ) == length l
-
+_overlap:: Eq a => (a, Slot) -> (a, Slot) -> Bool
 _overlap (i,a) (j, b) = helper a b && i /= j
     where helper x y = start x >= start y && start x <= end y || end x >= start y && end x <= end y
 
@@ -242,9 +243,11 @@ allOverlap xs =
 --     do
 --         hPutStrLn h "entered: error_state"
 
+userExist :: (Eq a, Ord k) => k -> Map k a -> Bool
 userExist login userMap = if user /= Nothing then True else False
     where user = Map.lookup login userMap
 
+doodleExist :: (Eq a, Ord k) => k -> Map k a -> Bool
 doodleExist identifier doodleMap =
     if maybeDoodle/= Nothing then True else False
     where maybeDoodle = Map.lookup identifier doodleMap
@@ -257,7 +260,7 @@ removeWSslotString ("set-doodle": login : doodleId : rest)
         where restStr = concat rest
 removeWSslotString args = args
 
-tokenizeRule :: Handle -> IO [String]
+tokenizeRule :: Handle -> IO (Maybe [[Char]])
 tokenizeRule h =
     do
         line <- hGetLine h
@@ -267,8 +270,9 @@ tokenizeRule h =
         tokens <- _tokenizeRule h args
         return (tokens)
 
-_tokenizeRule :: Handle -> [String] -> IO [String]
-_tokenizeRule _ (["exam-schedule", login]) = return (["exam-schedule", login])
+_tokenizeRule :: Handle -> [[Char]] -> IO (Maybe [[Char]])
+_tokenizeRule _ (["exam-schedule", login]) =
+        return (Just["exam-schedule", login])
 
 _tokenizeRule h (action : oldArgs)
     | length oldArgs < 2 =
@@ -281,10 +285,10 @@ _tokenizeRule h (action : oldArgs)
 _tokenizeRule h (["set-doodle", login, doodleId]) =
     do
         line <- hGetLine h
-        maybeSlotStr <- readDoodle h line
+        maybeSlotStr <- parseDoodleStr h line
         if maybeSlotStr /= Nothing
-            then return (["set-doodle", login, doodleId, fromJust maybeSlotStr])
-        else return (["set-doodle", login, doodleId, "error"])
+            then return (Just ["set-doodle", login, doodleId, fromJust maybeSlotStr])
+        else return Nothing
 
 _tokenizeRule h ["prefer", login, token] =
     do
@@ -293,26 +297,24 @@ _tokenizeRule h ["prefer", login, token] =
         _tokenizeRule h (["prefer", login, token] ++ args)
 
 _tokenizeRule _ (["prefer", login, token, slotStr]) =
-        return (["prefer", login, token, slotStr])
+        return (Just ["prefer", login, token, slotStr])
 
 -- all other actions
 _tokenizeRule _ ([action, login, token]) =
-        return ([action, login, token])
+        return (Just [action, login, token])
 
 _tokenizeRule h tokens@(["set-doodle", login, doodleId, str])
-    -- TODO: regex
     | startswith "[" str && endswith "]" str =
-            return (tokens)
+            return (Just tokens)
     | startswith "[" str =
             do
-               maybeSlotStr <- readDoodle' h str
+               maybeSlotStr <- _parseDoodleStr h str
                if maybeSlotStr /= Nothing
-                   then return (["set-doodle", login, doodleId, fromJust maybeSlotStr])
-                else return (["set-doodle", login, doodleId, "error"])
+                   then return (Just ["set-doodle", login, doodleId, fromJust maybeSlotStr])
+                else return Nothing
     | otherwise =
             do
-               hPutStrLn h "error slotstring does not start with ["
-               return []
+               return Nothing
 
 _tokenizeRule h (action : oldArgs)
     | length oldArgs < 2 =
@@ -322,34 +324,29 @@ _tokenizeRule h (action : oldArgs)
             _tokenizeRule h ((action : oldArgs) ++ args)
 
 
-_tokenizeRule _ _ =
-    -- hPutStrLn h "error state X"
-    return []
+_tokenizeRule _ _ = return Nothing
 
-
--- readDoodle :: Handle -> [Char] -> IO [Char]
-readDoodle h line
-    | startswith "[" line && endswith "]" stLine =
+parseDoodleStr:: Handle -> [Char] -> IO (Maybe String)
+parseDoodleStr h line
+    | startswith "[" line && endswith "]" ( strip line ) =
         return (Just $ stripChars "\t" line)
     | startswith "[" line =
-        readDoodle' h (stripChars " \t" line)
+        _parseDoodleStr h (stripChars " \t" line)
     | otherwise = return Nothing
-    where stLine = strip line
 
--- readDoodle' :: Handle -> [Char] -> IO [Char]
-readDoodle' h acc =
+_parseDoodleStr :: Handle -> [Char] -> IO (Maybe String)
+_parseDoodleStr h acc =
     do
         line <- hGetLine h
-        if ( endswith "]" line)
+        let count = countLetters line ']'
+        if ( endswith "]" line )
             then return (Just $ stripChars "\t" $ acc ++ line)
-            else if Data.List.isInfixOf "]" line == False
-                     then (readDoodle' h (acc ++ line))
+            else if count == 0
+                     then (_parseDoodleStr h (acc ++ line))
                 else return Nothing
-    -- where containsOnlyOne l =
-    --     length $ filter (==']')
+    where countLetters str c = length $ filter (== c) str
 
--- -- parseSlots :: [[Char]] -> [Slot]
-
+getVotes :: Slot -> Doodle -> Int
 getVotes ts doodle =
         if preferences /= Nothing then Set.size (fromJust preferences) else 0
     where preferences = Map.lookup ts $ timeslots doodle
@@ -363,11 +360,16 @@ parseSlots tss = foldl (\acc str ->
                        else Nothing
                  ) (Just Map.empty) tss
 
+parseSlot :: [Char] -> Maybe Slot
 parseSlot ts
-    | length tsList == 2 =
-    -- TODO:
-    Just Slot {start = st, end = et}
+    | length tsList == 2 && checkTimeStr st && checkTimeStr et =
+    Just Slot {start = timeFromString st, end = timeFromString et}
+    | otherwise = Nothing
     where tsList@(st : et : _) = splitOn "/" $ stripChars " " ts
 
-parseSlot _ = Nothing
+timeFromString:: String -> UTCTime
+timeFromString ds = readTime defaultTimeLocale "%FT%R%z" ( ds :: String ) :: UTCTime
 
+checkTimeStr:: String -> Bool
+checkTimeStr ds = if ( utcTime ds ) /= Nothing then True else False
+    where utcTime str = parseTime defaultTimeLocale "%FT%R%z" str :: Maybe UTCTime
