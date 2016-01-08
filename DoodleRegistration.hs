@@ -180,6 +180,7 @@ respAction ["subscribe", login, doodleId] h user transUserMap userMap transDoodl
 respAction ["prefer", login, doodleId, slotString] h user transUserMap userMap transDoodleMap doodleMap
     | maybeDoodle == Nothing = hPutStrLn h "no-such-id"
     | not subscribed  = hPutStrLn h "not-subscribed"
+    | maybeOldPrefs == Nothing = hPutStrLn h "timeslot does not exist!"
     | subscribed =
         let newDoodleMap = Map.insert doodleId Doodle {
                                                       name = doodleId,
@@ -194,51 +195,46 @@ respAction ["prefer", login, doodleId, slotString] h user transUserMap userMap t
           maybeDoodle   = Map.lookup doodleId doodleMap
           ts            = fromJust $ parseSlot slotString
           maybeOldPrefs = Map.lookup ts (timeslots doodle)
-          oldPrefs      = if maybeOldPrefs /= Nothing
-                              then fromJust maybeOldPrefs
-                          else Set.empty
+          oldPrefs      = fromJust maybeOldPrefs
           newPrefs      = Set.insert (uid user) oldPrefs
           newTimeslots  = Map.insert ts newPrefs (timeslots doodle)
 
-respAction ["exam-schedule", _] h user transUserMap userMap transDoodleMap doodleMap =
+respAction ["exam-schedule", _] h _ _ userMap _ doodleMap =
         -- let sch = calcSchedule userMap doodleMap
-        -- in hPutStrLn h (concatMap sch (\d -> show $ head d))
+        -- All possible schedules
         let sch = sequence [[(name d, ts, getVotes ts d)
                                | ts <- (Map.keys $ timeslots d)]
                                | d <- (Map.elems doodleMap)]
-            sumSeq = [(Map.fromList $ map (\(did, t, _) -> (did, t)) s, sumSnd s)| s <- sch]
+            sumSeq = [(Map.fromList $ map (\(did, t, _) -> (did, t)) s, _sumSnd s)| s <- sch]
             sortSeq = reverse $ sortBy (compare `on` snd) sumSeq
-            times = filterTimes sortSeq userMap
+            times = _getBestSchedule sortSeq userMap
         in do
               hPutStrLn h $ "COMBS" ++ show times
               -- hPutStrLn h $ "length" ++ show (length sumSeq)
 
--- noTimeClash :: Ord a => Map k (Ts a) -> (a, a) -> Bool
--- noTimeClash xs (t2, t3) = List.null $ Map.elems $ Map.filter (\y -> ( start y >= t2 && start y <= t3 || (end y >= t2 && end y <= t3) )) xs
-
-filterTimes sch userMap =
-     find (\(_, _, b)-> b==True) [(s, p, all (==False) [ allOverlap $ map fromJust $ filter (/=Nothing) userSlotList |
-                              userSlotList <- [[Map.lookup did s |
-                                          did <- Set.elems $ subs user]|
-                                          user <- Map.elems userMap
-                                          ]
-                               ]
+_getBestSchedule sch userMap =
+     find (\(_, _, b)-> b==True) [(s, p, all (==False) [
+                                 allOverlap $ map fromJust $ filter (/=Nothing) userSlotList |
+                                 userSlotList <- takenSlots userMap s]
                                 ) | (s, p) <- sch
                                ]
-
+    where takenSlots uMap schedule = [[Map.lookup did schedule |
+                          did <- Set.elems $ subs user]|
+                          user <- Map.elems uMap
+                          ]
 --
-sumSnd = foldr (\(_, _, c) acc -> c + acc) 0
+_sumSnd = foldr (\(_, _, c) acc -> c + acc) 0
 -- calcSchedule userMap doodleMap =
 
 -- hasNoDups:: [Slot] -> Bool
 -- hasNoDups l = ( length $ nubBy allOverlap l ) == length l
 
-overlap (i,a) (j, b) = helper a b && i /= j
+_overlap (i,a) (j, b) = helper a b && i /= j
     where helper x y = start x >= start y && start x <= end y || end x >= start y && end x <= end y
 
 allOverlap:: [Slot] -> Bool
 allOverlap xs =
-        any (==True) $ concat [[overlap x y |x <- zipped]| y <- zipped]
+        any (==True) $ concat [[_overlap x y |x <- zipped]| y <- zipped]
         where zipped = zip [0 ..] xs
 
 -- -- error state
@@ -253,20 +249,20 @@ doodleExist identifier doodleMap =
     if maybeDoodle/= Nothing then True else False
     where maybeDoodle = Map.lookup identifier doodleMap
 
--- remove whitespace in slot
-removeWs :: [[Char]] -> [[Char]]
-removeWs ("set-doodle": login : doodleId : rest)
+-- remove whitespace in slot string
+removeWSslotString :: [[Char]] -> [[Char]]
+removeWSslotString ("set-doodle": login : doodleId : rest)
         | startswith "[" $ head rest =
         ["set-doodle", login, doodleId, restStr]
         where restStr = concat rest
-removeWs args = args
+removeWSslotString args = args
 
 tokenizeRule :: Handle -> IO [String]
 tokenizeRule h =
     do
         line <- hGetLine h
         -- whitespace rmoval from time slot string
-        let args = removeWs $ splitWs line
+        let args = removeWSslotString $ splitWs line
         -- hPutStrLn h $ "chArgs" ++ show args
         tokens <- _tokenizeRule h args
         return (tokens)
@@ -285,8 +281,10 @@ _tokenizeRule h (action : oldArgs)
 _tokenizeRule h (["set-doodle", login, doodleId]) =
     do
         line <- hGetLine h
-        slotStr <- readDoodle h line
-        return (["set-doodle", login, doodleId, slotStr])
+        maybeSlotStr <- readDoodle h line
+        if maybeSlotStr /= Nothing
+            then return (["set-doodle", login, doodleId, fromJust maybeSlotStr])
+        else return (["set-doodle", login, doodleId, "error"])
 
 _tokenizeRule h ["prefer", login, token] =
     do
@@ -307,8 +305,10 @@ _tokenizeRule h tokens@(["set-doodle", login, doodleId, str])
             return (tokens)
     | startswith "[" str =
             do
-               slotStr <- readDoodle' h str
-               return (["set-doodle", login, doodleId, slotStr])
+               maybeSlotStr <- readDoodle' h str
+               if maybeSlotStr /= Nothing
+                   then return (["set-doodle", login, doodleId, fromJust maybeSlotStr])
+                else return (["set-doodle", login, doodleId, "error"])
     | otherwise =
             do
                hPutStrLn h "error slotstring does not start with ["
@@ -327,23 +327,26 @@ _tokenizeRule _ _ =
     return []
 
 
-readDoodle :: Handle -> [Char] -> IO [Char]
+-- readDoodle :: Handle -> [Char] -> IO [Char]
 readDoodle h line
     | startswith "[" line && endswith "]" stLine =
-        return (stripChars "\t" line)
+        return (Just $ stripChars "\t" line)
     | startswith "[" line =
-        do
-            readDoodle' h (stripChars "\t" line)
-    | otherwise = error "doodle does not begin with ["
+        readDoodle' h (stripChars " \t" line)
+    | otherwise = return Nothing
     where stLine = strip line
 
-readDoodle' :: Handle -> [Char] -> IO [Char]
+-- readDoodle' :: Handle -> [Char] -> IO [Char]
 readDoodle' h acc =
     do
         line <- hGetLine h
-        if (endswith "]" line)
-            then return (stripChars "\t" $ acc ++ line)
-            else (readDoodle' h (acc ++ line))
+        if ( endswith "]" line)
+            then return (Just $ stripChars "\t" $ acc ++ line)
+            else if Data.List.isInfixOf "]" line == False
+                     then (readDoodle' h (acc ++ line))
+                else return Nothing
+    -- where containsOnlyOne l =
+    --     length $ filter (==']')
 
 -- -- parseSlots :: [[Char]] -> [Slot]
 
