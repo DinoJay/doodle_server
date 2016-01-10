@@ -3,17 +3,12 @@ import System.IO
 -- import Control.Exception
 import Control.Concurrent
 import Control.Concurrent.STM
--- import Control.Concurrent.Chan
--- import Control.Monad
--- import Control.Monad.Fix (fix)
--- easier access to lists
--- import Control.Lens
 import System.Environment
 import Data.Maybe
 import Data.String.Utils
 import Data.List
 import Data.List.Split
--- import System.IO.Unsafe
+import System.IO.Unsafe
 import Data.Function
 import System.Random
 import qualified Data.Map as Map
@@ -28,7 +23,7 @@ data UserType = Teacher | Student | Administrator deriving (Show, Eq)
 
 data User = User {uid :: String, pw :: String, category :: UserType, subs :: Set String  } deriving (Show, Eq)
 
-data Slot = Slot {start :: UTCTime, end :: UTCTime}
+data Slot = Slot {start :: String, end :: String}
 
 
 instance Show Slot where
@@ -82,10 +77,11 @@ handleConnection h  transUserMap transDoodleMap = do
     handleRequest h transUserMap transDoodleMap
     hClose h
 
--- Code block to h login
+--  used to check login
 getUser :: [Char] -> Map [Char] User -> Maybe User
 getUser loginInfo userMap
-        | maybeUser == Nothing = Nothing
+        | maybeUser == Nothing =
+            Nothing
         | otherwise =
             let user = fromJust maybeUser
               in if pw user == enterPw then maybeUser else Nothing
@@ -93,6 +89,7 @@ getUser loginInfo userMap
         where [uidStr, enterPw] = Data.String.Utils.split "@" loginInfo
               maybeUser        = Map.lookup uidStr userMap
 
+-- wait for user input, tokenize and parse rules
 handleRequest::Handle -> TVar (Map [Char] User) -> TVar ( Map [Char] Doodle ) -> IO b
 handleRequest h transUserMap transDoodleMap =
     do
@@ -104,7 +101,6 @@ handleRequest h transUserMap transDoodleMap =
         else do
             let tokens = fromJust maybeTokens
             let login = tokens !! 1
-            -- tokens@(_: login: _) <- tokenizeRule h
             hPutStrLn h $ "tokens\n" ++ ( show tokens )
             userMap <- atomically $ readTVar transUserMap
             doodleMap <- atomically $ readTVar transDoodleMap
@@ -120,6 +116,7 @@ handleRequest h transUserMap transDoodleMap =
 
             handleRequest h transUserMap transDoodleMap
 
+-- parse rules perform actions
 respAction :: [[Char]] -> Handle -> User -> TVar (Map [Char] User)
     -> Map [Char] User -> TVar (Map [Char] Doodle) -> Map [Char] Doodle -> IO ()
 respAction [action, _, identifier] h user transUserMap userMap _ _
@@ -128,7 +125,7 @@ respAction [action, _, identifier] h user transUserMap userMap _ _
     | addRules =
             let newUserMap = Map.insert (identifier) User {
                                             uid      = identifier,
-                                            pw       = "aaaa",
+                                            pw       = randomStr,
                                             category = usertype,
                                             subs     = Set.empty
                                             } userMap
@@ -140,8 +137,9 @@ respAction [action, _, identifier] h user transUserMap userMap _ _
           isAdmin = category user == Administrator
           userExists = userExist identifier userMap
           usertype = if action == "add-teacher" then Teacher else Student
-          -- TODO
-          -- randomStr = take 4 $ randomRs ('a','z') $ unsafePerformIO newStdGen
+          randomStr = take randomNumber $ randomRs ('a','z') $ unsafePerformIO newStdGen
+          randomNumber = unsafePerformIO (getStdRandom (randomR (4, 12)))
+
 
 respAction ["set-doodle", _, doodleId, slotStr] h user _ _ transDoodleMap doodleMap
     | not isAdmin = hPutStrLn h "you are not Admin"
@@ -160,8 +158,27 @@ respAction ["set-doodle", _, doodleId, slotStr] h user _ _ transDoodleMap doodle
           maybeTs   = parseSlots timeList
           isAdmin   = category user == Administrator
 
+
+respAction ["get-doodle", _, doodleId] h _ _ _ _ doodleMap
+    | maybeDoodle /= Nothing =
+        hPutStrLn h (show $ fromJust maybeDoodle )
+    | otherwise = hPutStrLn h "no-such-id"
+    where maybeDoodle = Map.lookup doodleId doodleMap
+
+
+respAction ["change-password", _, newPw] h user transUserMap userMap _ _ =
+    let newUserMap = Map.insert (uid user) User {
+                                    uid      = uid user,
+                                    pw       = newPw,
+                                    category = category user,
+                                    subs     = subs user
+                                    } userMap
+    in do
+        atomically $ writeTVar transUserMap (newUserMap)
+        hPutStrLn h "ok"
+
 respAction ["subscribe", _, doodleId] h user transUserMap userMap _ doodleMap
-    | maybeDoodle == Nothing = hPutStrLn h "doodle does not exist"
+    | maybeDoodle == Nothing = hPutStrLn h "no-such-id"
     | subscribed = hPutStrLn h "user is already subscribed"
     | maybeDoodle /= Nothing =
         let newUserMap = Map.insert (uid user) User {
@@ -200,22 +217,29 @@ respAction ["prefer", _, doodleId, slotString] h user _ _ transDoodleMap doodleM
           newPrefs      = Set.insert (uid user) oldPrefs
           newTimeslots  = Map.insert ts newPrefs (timeslots doodle)
 
-respAction ["exam-schedule", _] h _ _ userMap _ doodleMap =
-        -- let sch = calcSchedule userMap doodleMap
-        -- All possible schedules
-        let sch = sequence [[(name d, ts, getVotes ts d)
+respAction ["exam-schedule", _] h _ _ userMap _ doodleMap
+        | bestScheduleTriple /= Nothing =
+            let
+                (scheduleMap, _, _) = fromJust bestScheduleTriple
+                scheduleBySlot = Map.assocs $ Map.fromList $ map (\(x,y) -> (y, x)) $ Map.assocs scheduleMap
+            in
+                hPutStrLn h $ show scheduleBySlot
+        | otherwise = hPutStrLn h "no-possible-exam-schedule"
+        where _sumSnd = foldr (\(_, _, c) acc -> c + acc) 0
+              -- get all possible schedules
+              allSchedules = sequence [[(name d, ts, getVotes ts d)
                                | ts <- (Map.keys $ timeslots d)]
                                | d <- (Map.elems doodleMap)]
-            sumSeq = [(Map.fromList $ map (\(did, t, _) -> (did, t)) s, _sumSnd s)| s <- sch]
-            sortSeq = reverse $ sortBy (compare `on` snd) sumSeq
-            times = _getBestSchedule sortSeq userMap
-        in do
-              hPutStrLn h $ "COMBS" ++ show times
+              allSchedulesWithScore = [(Map.fromList $ map (\(did, t, _) -> (did, t)) s, _sumSnd s)| s <- allSchedules]
+              allSchedulesSorted = reverse $ sortBy (compare `on` snd) allSchedulesWithScore
+              bestScheduleTriple =  _getBestSchedule allSchedulesSorted userMap
 
 _getBestSchedule :: [(Map String Slot, t)] -> Map k User -> Maybe (Map String Slot, t, Bool)
 _getBestSchedule sch userMap =
      find (\(_, _, b)-> b==True) [(s, p, all (==False) [
+                                 -- check for overlaps in the timeslot list for a user
                                  allOverlap $ map fromJust $ filter (/=Nothing) userSlotList |
+                                 -- get all time slots for exams taken by one user in current schedule
                                  userSlotList <- takenSlots userMap s]
                                 ) | (s, p) <- sch
                                ]
@@ -223,25 +247,19 @@ _getBestSchedule sch userMap =
                           did <- Set.elems $ subs user]|
                           user <- Map.elems uMap
                           ]
-_sumSnd :: [(t, t1, Int)] -> Int
-_sumSnd = foldr (\(_, _, c) acc -> c + acc) 0
--- calcSchedule userMap doodleMap =
 
--- hasNoDups:: [Slot] -> Bool
--- hasNoDups l = ( length $ nubBy allOverlap l ) == length l
+
+-- check for overlap between two time slots with id (i, j), only compare
+-- different timeslots
 _overlap:: Eq a => (a, Slot) -> (a, Slot) -> Bool
 _overlap (i,a) (j, b) = helper a b && i /= j
     where helper x y = start x >= start y && start x <= end y || end x >= start y && end x <= end y
 
+-- check all overlaps in Slot list taken by a user for a given schedule
 allOverlap:: [Slot] -> Bool
 allOverlap xs =
         any (==True) $ concat [[_overlap x y |x <- zipped]| y <- zipped]
         where zipped = zip [0 ..] xs
-
--- -- error state
--- respAction _ h _ _ _ _ _=
---     do
---         hPutStrLn h "entered: error_state"
 
 userExist :: (Eq a, Ord k) => k -> Map k a -> Bool
 userExist login userMap = if user /= Nothing then True else False
@@ -363,10 +381,13 @@ parseSlots tss = foldl (\acc str ->
 parseSlot :: [Char] -> Maybe Slot
 parseSlot ts
     | length tsList == 2 && checkTimeStr st && checkTimeStr et =
-    Just Slot {start = timeFromString st, end = timeFromString et}
+    Just Slot {start = st, end = et}
     | otherwise = Nothing
-    where tsList@(st : et : _) = splitOn "/" $ stripChars " " ts
+    where tsList = splitOn "/" $ stripChars " " ts
+          st    = tsList !! 0
+          et    = tsList !! 1
 
+-- for UTC time conversion
 timeFromString:: String -> UTCTime
 timeFromString ds = readTime defaultTimeLocale "%FT%R%z" ( ds :: String ) :: UTCTime
 
